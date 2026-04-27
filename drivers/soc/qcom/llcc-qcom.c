@@ -71,6 +71,8 @@
 #define LLCC_TRP_WRSC_CACHEABLE_EN    0x21f2c
 #define LLCC_TRP_ALGO_CFG8	      0x21f30
 
+#define LLCC_UID_CHAR_SIZE        4
+
 #define LLCC_VERSION_2_0_0_0          0x02000000
 #define LLCC_VERSION_2_1_0_0          0x02010000
 #define LLCC_VERSION_4_1_0_0          0x04010000
@@ -4404,6 +4406,170 @@ size_t llcc_get_slice_size(struct llcc_slice_desc *desc)
 	return desc->slice_size;
 }
 EXPORT_SYMBOL_GPL(llcc_get_slice_size);
+
+static int __uid_list_to_str(u32 *slice_list, u32 len, char *out, u32 out_len)
+{
+	char *cur;
+	int i, cur_sz, res, ret = 0;
+
+	cur = out;
+	cur_sz = out_len;
+
+	for (i = 0; cur && cur_sz > 0 && i < len; i++) {
+		if (i == 0)
+			ret = scnprintf(cur, cur_sz, "%d", slice_list[i]);
+		else
+			ret = scnprintf(cur, cur_sz, " %d", slice_list[i]);
+		
+		cur += ret;
+		cur_sz -= ret;
+		res += ret;
+	}
+
+	return res;
+}
+
+static u32 *llcc_poll_slices(struct device *dev, u32 *num_active, bool is_active)
+{
+	const struct llcc_slice_config *cfg;
+	struct llcc_slice_desc *desc;
+	u32 sz, count, index, refcount;
+	u32 *active_slices = NULL;
+
+	if (IS_ERR(drv_data))
+		return ERR_CAST(drv_data);
+
+	desc = drv_data->desc;
+	cfg = drv_data->cfg;
+	sz = drv_data->cfg_size;
+
+	active_slices = devm_kcalloc(dev, sz, sizeof(u32), GFP_KERNEL);
+	if (!active_slices)
+		return ERR_PTR(-ENOMEM);
+
+	for (count = 0, index = 0; cfg && count < sz && index < sz; count++, cfg++) {
+		refcount = refcount_read(&desc[index].refcount);
+		if(is_active && refcount > 0) {
+			active_slices[index] = cfg->usecase_id;
+			index++;
+		} else if (!is_active && refcount == 0) {
+			active_slices[index] = cfg->usecase_id;
+			index++;
+		}
+	}
+
+	return active_slices;
+}
+
+static ssize_t sysfs_llcc_activate_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	char *str;
+	u32 *active_slices;
+	u32 sz, num_slices = 0;
+	int ret = 0;
+
+	active_slices = llcc_poll_slices(dev, &num_slices, true);
+	if (IS_ERR(active_slices))
+		return PTR_ERR(active_slices);
+	
+	/* give four chars per slice; three for the number, one for a space */
+	sz = drv_data->cfg_size * sizeof(char) * LLCC_UID_CHAR_SIZE;
+	str = devm_kzalloc(dev, sz, GFP_KERNEL);
+	if (!str) {
+		devm_kfree(dev, active_slices);
+		return -ENOMEM;
+	}
+
+	ret = __uid_list_to_str(active_slices, num_slices, str, sz);
+	devm_kfree(dev, active_slices);
+	if (!ret) {
+		devm_kfree(dev, str);
+		return ret;
+	}
+
+	ret = sysfs_emit(buf, "%s\n", str);
+	devm_kfree(dev, str);
+
+	return ret;
+};
+
+static ssize_t sysfs_llcc_activate_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	int ret;
+	u32 slice_id;
+	struct llcc_slice_desc *slice;
+
+	ret = kstrtou32_from_user(buf, count, 0, &slice_id);
+	if (ret)
+		return ret;
+
+	slice = llcc_slice_getd(slice_id);
+	if (IS_ERR(slice))
+		return PTR_ERR(slice);
+
+	ret = llcc_slice_activate(slice);
+
+	llcc_slice_putd(slice);
+
+	return ret;
+}
+
+static ssize_t sysfs_llcc_deactivate_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	char *str;
+	u32 *active_slices;
+	u32 sz, num_slices = 0;
+	int ret = 0;
+
+	active_slices = llcc_poll_slices(dev, &num_slices, false);
+	if (IS_ERR(active_slices))
+		return PTR_ERR(active_slices);
+
+	/* give four chars per slice; three for the number, one for a space */
+	sz = drv_data->cfg_size * sizeof(char) * LLCC_UID_CHAR_SIZE;
+	str = devm_kzalloc(dev, sz, GFP_KERNEL);
+	if (!str) {
+		devm_kfree(dev, active_slices);
+		return -ENOMEM;
+	}
+
+	ret = __uid_list_to_str(active_slices, num_slices, str, sz);
+	devm_kfree(dev, active_slices);
+	if (!ret) {
+		devm_kfree(dev, str);
+		return ret;
+	}
+
+	ret = sysfs_emit(buf, "%s\n", str);
+	devm_kfree(dev, str);
+
+	return ret;
+};
+
+static ssize_t sysfs_llcc_deactivate_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	int ret;
+	u32 slice_id;
+	struct llcc_slice_desc *slice;
+
+	ret = kstrtou32_from_user(buf, count, 0, &slice_id);
+	if (ret)
+		return ret;
+
+	slice = llcc_slice_getd(slice_id);
+	if (IS_ERR(slice))
+		return PTR_ERR(slice);
+
+	ret = llcc_slice_deactivate(slice);
+
+	llcc_slice_putd(slice);
+
+	return ret;
+}
 
 static int _qcom_llcc_cfg_program(const struct llcc_slice_config *config,
 				  const struct qcom_llcc_config *cfg)
